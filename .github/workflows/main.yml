@@ -1,0 +1,125 @@
+# Copy to .github/workflows/release.yml in a research data repo.
+#
+# Builds the dataset, zips README + script + CSV into <SLUG>.zip, and attaches it to a GitHub
+# release, which is what birdyfoot.com/research/<slug>/download serves.
+#
+# Runs when:
+#   - you publish a release in the GitHub UI (any tag name, e.g. nov-12-2026)
+#   - you push a tag like v2026.11 (the release is created if it doesn't exist)
+#   - you run it by hand from the Actions tab with an existing release tag
+#   - monthly, ONLY if the repository variable RESEARCH_MONTHLY_ENABLED is "true" (off by default)
+name: Publish release asset
+
+on:
+  release:
+    types: [published]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the zip to (for example nov-12-2026)"
+        required: true
+        type: string
+  schedule:
+    - cron: "0 14 1 * *"
+
+permissions:
+  contents: write # create the release and upload the asset; nothing else
+
+env:
+  # Adjust these four per repository.
+  SLUG: ai-tool-vulnerabilities # the zip is named <SLUG>.zip and must match "asset" in the website's report metadata
+  CSV: ai_tool_vulnerabilities.csv
+  SCRIPT: build_dataset.py
+  MIN_ROWS: "500" # refuse to publish if the rebuilt CSV is suspiciously small
+
+concurrency:
+  group: release-asset-${{ github.event.release.tag_name || github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # The monthly run is behind a switch: Settings > Secrets and variables > Actions > Variables.
+    if: github.event_name != 'schedule' || vars.RESEARCH_MONTHLY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Work out the release tag
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PUSHED_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            release) TAG="$RELEASE_TAG" ;;
+            push) TAG="$PUSHED_TAG" ;;
+            workflow_dispatch) TAG="$INPUT_TAG" ;;
+            schedule) TAG="v$(date -u +%Y.%m)" ;;
+            *) echo "Unexpected event $EVENT"; exit 1 ;;
+          esac
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then echo "::error::Refusing unusual tag name"; exit 1; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # A monthly run does nothing if this month's release already exists.
+          if [ "$EVENT" = "schedule" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.tag.outputs.skip != 'true'
+        with:
+          # Releases build the code at their tag; the monthly run builds the default branch.
+          ref: ${{ github.event_name == 'schedule' && github.ref || steps.tag.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        if: steps.tag.outputs.skip != 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Rebuild the dataset
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # The output file name is passed explicitly so this works whatever the script's default is.
+          python3 "$SCRIPT" "$CSV"
+          rows=$(( $(wc -l < "$CSV") - 1 ))
+          echo "Rebuilt $CSV with $rows rows."
+          if [ "$rows" -lt "$MIN_ROWS" ]; then
+            echo "::error::Only $rows rows in $CSV (expected at least $MIN_ROWS); not publishing."
+            exit 1
+          fi
+          echo "rows=$rows" >> "$GITHUB_ENV"
+
+      - name: Zip the release asset
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -j "dist/$SLUG.zip" README.md "$SCRIPT" "$CSV"
+          unzip -l "dist/$SLUG.zip"
+
+      - name: Create the release if needed, then upload the asset
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          built="$(date -u +%Y-%m-%d)"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --target "${GITHUB_SHA}" \
+              --notes "Dataset rebuilt from the GitHub Advisory Database on $built ($rows rows)."
+          fi
+          # --clobber replaces the asset when you re-run for the same release.
+          gh release upload "$TAG" "dist/$SLUG.zip" --clobber
+          {
+            echo "### Published \`$SLUG.zip\` to release \`$TAG\`"
+            echo "- Rebuilt on $built with $rows rows"
+            echo "- https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
